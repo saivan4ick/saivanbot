@@ -219,10 +219,50 @@ def admin_keyboard(suggestion_id: str, user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🚫 Заблокированные", callback_data="panel:blocked")],
+            [InlineKeyboardButton("↩️ Отменить ответ", callback_data="panel:cancel")],
+            [InlineKeyboardButton("ℹ️ Как работать", callback_data="panel:help")],
+        ]
+    )
+
+
 def blocked_keyboard(blocked_users: List[int]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(f"Разблокировать {user_id}", callback_data=f"unblock:{user_id}")]
          for user_id in blocked_users]
+    )
+
+
+def admin_panel_text() -> str:
+    return (
+        "<b>Админ-панель</b>\n\n"
+        "Доступные действия:\n"
+        "• смотреть и разблокировать пользователей;\n"
+        "• отменять режим ответа;\n"
+        "• отвечать, удалять и блокировать через кнопки под каждой предложкой."
+    )
+
+
+async def send_blocked_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    blocked_users = get_blocked_users()
+    if not blocked_users:
+        await message.reply_text("Список заблокированных пуст.")
+        return
+
+    lines = ["<b>Заблокированные пользователи</b>"]
+    for index, user in enumerate(blocked_users, start=1):
+        user_id = user["user_id"]
+        lines.append(f"{index}. {stored_user_label(user_id, user)} — <code>{user_id}</code>")
+
+    await message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=blocked_keyboard([user["user_id"] for user in blocked_users]),
+        disable_web_page_preview=True,
     )
 
 
@@ -247,26 +287,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Режим ответа отменен.")
 
 
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != context.bot_data["admin_id"]:
+        return
+
+    await update.message.reply_text(
+        admin_panel_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
 async def blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != context.bot_data["admin_id"]:
         return
 
-    blocked_users = get_blocked_users()
-    if not blocked_users:
-        await update.message.reply_text("Список заблокированных пуст.")
-        return
-
-    lines = ["<b>Заблокированные пользователи</b>"]
-    for index, user in enumerate(blocked_users, start=1):
-        user_id = user["user_id"]
-        lines.append(f"{index}. {stored_user_label(user_id, user)} — <code>{user_id}</code>")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        reply_markup=blocked_keyboard([user["user_id"] for user in blocked_users]),
-        disable_web_page_preview=True,
-    )
+    await send_blocked_users(update, context)
 
 
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -348,6 +384,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     action, value = query.data.split(":", 1)
 
+    if action == "panel":
+        if value == "blocked":
+            await send_blocked_users(update, context)
+            return
+
+        if value == "cancel":
+            context.user_data.pop("reply_to_user_id", None)
+            await query.message.reply_text("Режим ответа отменен.")
+            return
+
+        if value == "help":
+            await query.message.reply_text(admin_panel_text(), parse_mode=ParseMode.HTML)
+            return
+
     if action == "reply":
         suggestion = get_suggestion(value)
         if not suggestion:
@@ -423,6 +473,7 @@ def main() -> None:
     init_db()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", admin))
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("blocked", blocked))
     application.add_handler(CallbackQueryHandler(on_button))
