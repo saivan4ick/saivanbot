@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.agents
+.opencode
+data/bot.db
+skills-lock.json
+data/bot.db

@@ -5,18 +5,14 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
-
+from aiogram import Bot, Dispatcher, Router, F, types
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 DATA_DIR = Path("data")
 DB_PATH = DATA_DIR / "bot.db"
@@ -148,20 +144,6 @@ def get_suggestion(suggestion_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def get_latest_suggestion_by_user(user_id: int) -> Optional[dict]:
-    with get_db() as connection:
-        row = connection.execute(
-            """
-            SELECT * FROM suggestions
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (user_id,),
-        ).fetchone()
-    return dict(row) if row else None
-
-
 def delete_suggestion(suggestion_id: str) -> Optional[dict]:
     suggestion = get_suggestion(suggestion_id)
     if not suggestion:
@@ -172,6 +154,12 @@ def delete_suggestion(suggestion_id: str) -> Optional[dict]:
     return suggestion
 
 
+# Define FSM States for Admin
+class AdminStates(StatesGroup):
+    waiting_for_reply = State()
+
+
+# Helper to get Admin ID
 def get_admin_id() -> int:
     admin_id = os.getenv("ADMIN_ID")
     if not admin_id or not admin_id.isdigit():
@@ -179,61 +167,62 @@ def get_admin_id() -> int:
     return int(admin_id)
 
 
-def user_link(user) -> str:
-    name = html.escape(user.full_name or str(user.id))
-    profile = f'<a href="tg://user?id={user.id}">{name}</a>'
-    if user.username:
-        username = html.escape(user.username)
-        return f'{profile} (@{username})'
-    return profile
-
-
-def user_info(user) -> dict:
-    return {
-        "full_name": user.full_name or str(user.id),
-        "username": user.username,
-    }
-
-
-def stored_user_label(user_id: int, info: Optional[dict]) -> str:
-    if not info:
-        return f'<a href="tg://user?id={user_id}">{user_id}</a>'
-
-    name = html.escape(info.get("full_name") or str(user_id))
+def user_link(user_id: int, full_name: str, username: Optional[str]) -> str:
+    name = html.escape(full_name or str(user_id))
     profile = f'<a href="tg://user?id={user_id}">{name}</a>'
-    username = info.get("username")
     if username:
         return f'{profile} (@{html.escape(username)})'
     return profile
 
 
-def admin_keyboard(suggestion_id: str, user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🙋‍♂️ Ответить", callback_data=f"reply:{suggestion_id}")],
-            [
-                InlineKeyboardButton("❌ Удалить", callback_data=f"delete:{suggestion_id}"),
-                InlineKeyboardButton("🤬 Заблокировать", callback_data=f"block:{user_id}"),
-            ],
-        ]
-    )
+def is_anonymous_info(info: Optional[dict]) -> bool:
+    return bool(info and info.get("full_name") == "Аноним" and not info.get("username"))
 
 
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🚫 Заблокированные", callback_data="panel:blocked")],
-            [InlineKeyboardButton("↩️ Отменить ответ", callback_data="panel:cancel")],
-            [InlineKeyboardButton("ℹ️ Как работать", callback_data="panel:help")],
-        ]
-    )
+def stored_user_label(user_id: int, info: Optional[dict]) -> str:
+    if is_anonymous_info(info):
+        return "Анонимный пользователь"
+
+    if not info:
+        return f'<a href="tg://user?id={user_id}">{user_id}</a>'
+
+    return user_link(user_id, info.get("full_name") or str(user_id), info.get("username"))
 
 
-def blocked_keyboard(blocked_users: List[int]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"Разблокировать {user_id}", callback_data=f"unblock:{user_id}")]
-         for user_id in blocked_users]
-    )
+# Keyboards Builder
+def get_privacy_keyboard(message_id: int) -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Анонимно", callback_data=f"privacy:anonymous:{message_id}")
+    builder.button(text="🙋‍♂️ С именем и ID", callback_data=f"privacy:public:{message_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_admin_keyboard(suggestion_id: str) -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🙋‍♂️ Ответить", callback_data=f"reply:{suggestion_id}")
+    builder.button(text="❌ Удалить", callback_data=f"delete:{suggestion_id}")
+    builder.button(text="🤬 Заблокировать", callback_data=f"block:{suggestion_id}")
+    builder.adjust(1, 2)
+    return builder.as_markup()
+
+
+def get_admin_panel_keyboard() -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Заблокированные", callback_data="panel:blocked")
+    builder.button(text="↩️ Отменить ответ", callback_data="panel:cancel")
+    builder.button(text="ℹ️ Как работать", callback_data="panel:help")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_blocked_keyboard(blocked_users: List[dict]) -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for user in blocked_users:
+        label = "Разблокировать анонима" if is_anonymous_info(user) else f"Разблокировать {user['user_id']}"
+        builder.button(text=label, callback_data=f"unblock:{user['user_id']}")
+    builder.adjust(1)
+    return builder.as_markup()
 
 
 def admin_panel_text() -> str:
@@ -246,244 +235,348 @@ def admin_panel_text() -> str:
     )
 
 
-async def send_blocked_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
+# Router creation
+router = Router()
+
+
+@router.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    admin_id = get_admin_id()
+    if message.from_user.id == admin_id:
+        await message.answer(
+            "Бот предложки запущен. Пользователи могут присылать сюда текст, фото, видео, документы, голосовые и другой контент."
+        )
+        return
+
+    await message.answer(
+        "📤 Отправь сюда текст, картинку, видео, документ или другой контент для предложки. "
+        "После каждого сообщения бот спросит, показывать админу твое имя и ID или отправить анонимно."
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    admin_id = get_admin_id()
+    if message.from_user.id != admin_id:
+        return
+
+    await state.clear()
+    await message.answer("Режим ответа отменен.")
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    admin_id = get_admin_id()
+    if message.from_user.id != admin_id:
+        return
+
+    await message.answer(
+        admin_panel_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=get_admin_panel_keyboard(),
+    )
+
+
+async def send_blocked_users_list(message: types.Message):
     blocked_users = get_blocked_users()
     if not blocked_users:
-        await message.reply_text("Список заблокированных пуст.")
+        await message.answer("Список заблокированных пуст.")
         return
 
     lines = ["<b>Заблокированные пользователи</b>"]
     for index, user in enumerate(blocked_users, start=1):
         user_id = user["user_id"]
-        lines.append(f"{index}. {stored_user_label(user_id, user)} — <code>{user_id}</code>")
+        if is_anonymous_info(user):
+            lines.append(f"{index}. {stored_user_label(user_id, user)}")
+        else:
+            lines.append(f"{index}. {stored_user_label(user_id, user)} — <code>{user_id}</code>")
 
-    await message.reply_text(
+    await message.answer(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=blocked_keyboard([user["user_id"] for user in blocked_users]),
+        reply_markup=get_blocked_keyboard(blocked_users),
         disable_web_page_preview=True,
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id == context.bot_data["admin_id"]:
-        await update.message.reply_text(
-            "Бот предложки запущен. Пользователи могут присылать сюда текст, фото, видео, документы, голосовые и другой контент."
-        )
+@router.message(Command("blocked"))
+async def cmd_blocked(message: types.Message):
+    admin_id = get_admin_id()
+    if message.from_user.id != admin_id:
         return
 
-    await update.message.reply_text(
-        "📤 Отправь сюда текст, картинку, видео, документ или другой контент для предложки. "
-        "Админ увидит сообщение и сможет ответить."
-    )
+    await send_blocked_users_list(message)
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != context.bot_data["admin_id"]:
+# Handlers for admin FSM states
+@router.message(AdminStates.waiting_for_reply)
+async def handle_admin_reply(message: types.Message, state: FSMContext, bot: Bot):
+    admin_id = get_admin_id()
+    if message.from_user.id != admin_id:
         return
 
-    context.user_data.pop("reply_to_user_id", None)
-    await update.message.reply_text("Режим ответа отменен.")
+    state_data = await state.get_data()
+    user_id = state_data.get("reply_to_user_id")
 
-
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != context.bot_data["admin_id"]:
-        return
-
-    await update.message.reply_text(
-        admin_panel_text(),
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_panel_keyboard(),
-    )
-
-
-async def blocked(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != context.bot_data["admin_id"]:
-        return
-
-    await send_blocked_users(update, context)
-
-
-async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = context.user_data.get("reply_to_user_id")
     if not user_id:
-        await update.message.reply_text("Нажми кнопку «Ответить» под предложкой, потом отправь ответ.")
+        await message.answer("Пользователь для ответа не найден. Попробуй нажать кнопку «Ответить» еще раз.")
+        await state.clear()
         return
 
     try:
-        await context.bot.copy_message(
+        await bot.copy_message(
             chat_id=user_id,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
         )
-    except Forbidden:
-        await update.message.reply_text("Не удалось отправить ответ: пользователь заблокировал бота.")
-        return
-    except TelegramError as error:
-        await update.message.reply_text(f"Не удалось отправить ответ: {error}")
-        return
+        await message.answer("Ответ отправлен пользователю.")
+        await state.clear()
+    except TelegramAPIError as e:
+        if "Forbidden" in str(e) or "blocked" in str(e).lower():
+            await message.answer("Не удалось отправить ответ: пользователь заблокировал бота.")
+        else:
+            await message.answer(f"Не удалось отправить ответ: {e}")
+        await state.clear()
 
-    context.user_data.pop("reply_to_user_id", None)
-    await update.message.reply_text("Ответ отправлен пользователю.")
+
+# Fallback for Admin
+@router.message(F.chat.id == F.bot.id)  # placeholder / checking if admin messages in private
+async def admin_messages(message: types.Message, state: FSMContext):
+    # This gets handled below after suggestion handler if not admin
+    pass
 
 
-async def handle_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    admin_id = context.bot_data["admin_id"]
-
+# Callback Handlers
+@router.callback_query(F.data.startswith("privacy:"))
+async def on_privacy_choice(callback: types.CallbackQuery, bot: Bot):
+    user = callback.from_user
     if is_blocked(user.id):
-        await update.message.reply_text("Ты заблокирован в предложке.")
+        await callback.answer("Ты заблокирован в предложке.", show_alert=True)
+        await callback.message.edit_text("Ты заблокирован в предложке.")
         return
 
+    parts = callback.data.split(":")
+    privacy_mode = parts[1]
+    message_id = int(parts[2])
+
+    admin_id = get_admin_id()
     suggestion_id = uuid4().hex[:10]
 
     try:
-        copied = await context.bot.copy_message(
+        # Copy user suggestion to admin
+        copied = await bot.copy_message(
             chat_id=admin_id,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
+            from_chat_id=callback.message.chat.id,
+            message_id=message_id,
         )
-    except TelegramError as error:
-        await update.message.reply_text("Не удалось отправить предложку админу. Попробуй позже.")
-        await context.bot.send_message(admin_id, f"Ошибка при копировании предложки: {error}")
+    except TelegramAPIError as e:
+        await callback.message.edit_text("Не удалось отправить предложку админу. Попробуй позже.")
+        await bot.send_message(admin_id, f"Ошибка при копировании предложки: {e}")
+        await callback.answer()
         return
 
-    panel_text = (
-        "<b>Новая предложка</b>\n"
-        f"Отправитель: {user_link(user)}\n"
-        f"ID: <code>{user.id}</code>"
-    )
-    panel = await context.bot.send_message(
+    if privacy_mode == "public":
+        panel_text = (
+            "<b>Новая предложка</b>\n"
+            f"Отправитель: {user_link(user.id, user.full_name, user.username)}\n"
+            f"ID: <code>{user.id}</code>"
+        )
+        info = {"full_name": user.full_name or str(user.id), "username": user.username}
+    else:
+        panel_text = "<b>Новая предложка</b>\nОтправитель: анонимно"
+        info = {"full_name": "Аноним", "username": None}
+
+    # Send admin options panel
+    panel = await bot.send_message(
         chat_id=admin_id,
         text=panel_text,
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_keyboard(suggestion_id, user.id),
+        reply_markup=get_admin_keyboard(suggestion_id),
         disable_web_page_preview=True,
     )
 
     save_suggestion(
         suggestion_id=suggestion_id,
         user_id=user.id,
-        info=user_info(user),
+        info=info,
         admin_content_message_id=copied.message_id,
         admin_panel_message_id=panel.message_id,
     )
 
-    await update.message.reply_text("Предложка отправлена админу.")
+    await callback.message.edit_text("Предложка отправлена админу.")
+    await callback.answer()
 
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-
-    if query.from_user.id != context.bot_data["admin_id"]:
-        await query.answer("Эта кнопка только для админа.", show_alert=True)
+@router.callback_query(F.data.startswith("reply:"))
+async def on_admin_reply_btn(callback: types.CallbackQuery, state: FSMContext):
+    admin_id = get_admin_id()
+    if callback.from_user.id != admin_id:
+        await callback.answer("Эта кнопка только для админа.", show_alert=True)
         return
 
-    await query.answer()
-
-    action, value = query.data.split(":", 1)
-
-    if action == "panel":
-        if value == "blocked":
-            await send_blocked_users(update, context)
-            return
-
-        if value == "cancel":
-            context.user_data.pop("reply_to_user_id", None)
-            await query.message.reply_text("Режим ответа отменен.")
-            return
-
-        if value == "help":
-            await query.message.reply_text(admin_panel_text(), parse_mode=ParseMode.HTML)
-            return
-
-    if action == "reply":
-        suggestion = get_suggestion(value)
-        if not suggestion:
-            await query.edit_message_text("Предложка не найдена. Возможно, бот был перезапущен со старой кнопкой.")
-            return
-
-        context.user_data["reply_to_user_id"] = suggestion["user_id"]
-        await query.message.reply_text("Отправь следующее сообщение, и оно уйдет пользователю. /cancel - отмена.")
+    suggestion_id = callback.data.split(":")[1]
+    suggestion = get_suggestion(suggestion_id)
+    if not suggestion:
+        await callback.message.edit_text("Предложка не найдена. Возможно, бот был перезапущен со старой кнопкой.")
+        await callback.answer()
         return
 
-    if action == "delete":
-        suggestion = delete_suggestion(value)
-        if not suggestion:
-            await query.edit_message_text("Предложка уже удалена или не найдена.")
-            return
+    await state.set_state(AdminStates.waiting_for_reply)
+    await state.update_data(reply_to_user_id=suggestion["user_id"])
+    await callback.message.answer("Отправь следующее сообщение, и оно уйдет пользователю. /cancel — отмена.")
+    await callback.answer()
 
-        await delete_admin_message(context, suggestion.get("admin_content_message_id"))
-        await query.edit_message_text("Предложка удалена.")
+
+@router.callback_query(F.data.startswith("delete:"))
+async def on_admin_delete_btn(callback: types.CallbackQuery, bot: Bot):
+    admin_id = get_admin_id()
+    if callback.from_user.id != admin_id:
+        await callback.answer("Эта кнопка только для админа.", show_alert=True)
         return
 
-    if action == "block":
-        user_id = int(value)
-        suggestion = get_latest_suggestion_by_user(user_id)
-        info = {
-            "full_name": suggestion["full_name"] if suggestion else str(user_id),
-            "username": suggestion["username"] if suggestion else None,
-        }
-        block_user(user_id, info)
-        await query.message.reply_text(f"Пользователь <code>{user_id}</code> заблокирован.", parse_mode=ParseMode.HTML)
+    suggestion_id = callback.data.split(":")[1]
+    suggestion = delete_suggestion(suggestion_id)
+    if not suggestion:
+        await callback.message.edit_text("Предложка уже удалена или не найдена.")
+        await callback.answer()
         return
 
-    if action == "unblock":
-        user_id = int(value)
-        unblock_user(user_id)
+    # Delete content message
+    if suggestion.get("admin_content_message_id"):
+        try:
+            await bot.delete_message(admin_id, suggestion["admin_content_message_id"])
+        except TelegramAPIError:
+            pass
 
-        await query.message.reply_text(f"Пользователь <code>{user_id}</code> разблокирован.", parse_mode=ParseMode.HTML)
+    await callback.message.edit_text("Предложка удалена.")
+    await callback.answer()
 
-        blocked_users = get_blocked_users()
-        if blocked_users:
-            lines = ["<b>Заблокированные пользователи</b>"]
-            for index, user in enumerate(blocked_users, start=1):
-                blocked_user_id = user["user_id"]
+
+@router.callback_query(F.data.startswith("block:"))
+async def on_admin_block_btn(callback: types.CallbackQuery):
+    admin_id = get_admin_id()
+    if callback.from_user.id != admin_id:
+        await callback.answer("Эта кнопка только для админа.", show_alert=True)
+        return
+
+    suggestion_id = callback.data.split(":")[1]
+    suggestion = get_suggestion(suggestion_id)
+    if not suggestion:
+        await callback.message.edit_text("Предложка не найдена.")
+        await callback.answer()
+        return
+
+    user_id = suggestion["user_id"]
+    is_anon = is_anonymous_info(suggestion)
+    info = {
+        "full_name": suggestion["full_name"],
+        "username": suggestion["username"],
+    }
+    block_user(user_id, info)
+
+    if is_anon:
+        await callback.message.answer("Анонимный отправитель заблокирован.")
+    else:
+        await callback.message.answer(f"Пользователь {user_id} заблокирован.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("unblock:"))
+async def on_admin_unblock_btn(callback: types.CallbackQuery):
+    admin_id = get_admin_id()
+    if callback.from_user.id != admin_id:
+        await callback.answer("Эта кнопка только для админа.", show_alert=True)
+        return
+
+    user_id = int(callback.data.split(":")[1])
+    blocked_list = get_blocked_users()
+    blocked_info = next((u for u in blocked_list if u["user_id"] == user_id), None)
+    unblock_user(user_id)
+
+    if is_anonymous_info(blocked_info):
+        await callback.message.answer("Анонимный пользователь разблокирован.")
+    else:
+        await callback.message.answer(f"Пользователь {user_id} разблокирован.")
+
+    # Update panel
+    blocked_users = get_blocked_users()
+    if blocked_users:
+        lines = ["<b>Заблокированные пользователи</b>"]
+        for index, user in enumerate(blocked_users, start=1):
+            blocked_user_id = user["user_id"]
+            if is_anonymous_info(user):
+                lines.append(f"{index}. {stored_user_label(blocked_user_id, user)}")
+            else:
                 lines.append(f"{index}. {stored_user_label(blocked_user_id, user)} — <code>{blocked_user_id}</code>")
 
-            await query.edit_message_text(
-                "\n".join(lines),
-                parse_mode=ParseMode.HTML,
-                reply_markup=blocked_keyboard([user["user_id"] for user in blocked_users]),
-                disable_web_page_preview=True,
-            )
-        else:
-            await query.edit_message_text("Список заблокированных пуст.")
+        await callback.message.edit_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_blocked_keyboard(blocked_users),
+            disable_web_page_preview=True,
+        )
+    else:
+        await callback.message.edit_text("Список заблокированных пуст.")
+    await callback.answer()
 
 
-async def delete_admin_message(context: ContextTypes.DEFAULT_TYPE, message_id: Optional[int]) -> None:
-    if not message_id:
+@router.callback_query(F.data.startswith("panel:"))
+async def on_admin_panel_btn(callback: types.CallbackQuery, state: FSMContext):
+    admin_id = get_admin_id()
+    if callback.from_user.id != admin_id:
+        await callback.answer("Эта кнопка только для админа.", show_alert=True)
         return
-    try:
-        await context.bot.delete_message(context.bot_data["admin_id"], message_id)
-    except BadRequest:
-        pass
+
+    action = callback.data.split(":")[1]
+
+    if action == "blocked":
+        await send_blocked_users_list(callback.message)
+    elif action == "cancel":
+        await state.clear()
+        await callback.message.answer("Режим ответа отменен.")
+    elif action == "help":
+        await callback.message.answer(admin_panel_text(), parse_mode=ParseMode.HTML)
+
+    await callback.answer()
 
 
-def main() -> None:
+# Suggestions Handler
+@router.message(F.chat.type == "private")
+async def handle_user_suggestion(message: types.Message):
+    admin_id = get_admin_id()
+    if message.from_user.id == admin_id:
+        # Admin sending general text without being in waiting_for_reply state
+        if not message.text or not message.text.startswith("/"):
+            await message.answer("Нажми кнопку «Ответить» под предложкой, потом отправь ответ.")
+        return
+
+    if is_blocked(message.from_user.id):
+        await message.answer("Ты заблокирован в предложке.")
+        return
+
+    # Prompt user for anonymity choice
+    await message.answer(
+        "Как отправить эту предложку админу?",
+        reply_markup=get_privacy_keyboard(message.message_id),
+    )
+
+
+async def main() -> None:
     load_env()
+    init_db()
 
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("Set BOT_TOKEN in .env.")
 
-    application = Application.builder().token(token).build()
-    application.bot_data["admin_id"] = get_admin_id()
-    init_db()
+    bot = Bot(token=token)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("cancel", cancel))
-    application.add_handler(CommandHandler("blocked", blocked))
-    application.add_handler(CallbackQueryHandler(on_button))
-    application.add_handler(
-        MessageHandler(filters.Chat(application.bot_data["admin_id"]) & ~filters.COMMAND, handle_admin_message)
-    )
-    application.add_handler(MessageHandler(~filters.COMMAND, handle_suggestion))
-
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Start polling
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())

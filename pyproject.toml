@@ -5,5 +5,6 @@ description = "предложка сайвана"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "python-telegram-bot==22.8",
+    "aiogram>=3.0.0",
 ]
+
